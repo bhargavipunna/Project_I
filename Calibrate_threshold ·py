@@ -1,0 +1,164 @@
+"""
+calibrate_threshold.py
+======================
+WHAT CHANGED FROM ORIGINAL:
+  - 300 frames per camera (was 30 — too few for reliable statistics)
+  - Requires 20 stable consecutive frames per track (was 4 — ID-switch noise)
+  - Runs on ALL cameras in data/, not just cam1.mp4
+  - Writes per-camera FAISS_THRESHOLD_CAM* values to .env automatically
+  - Flags distribution overlap (when no perfect threshold exists)
+  - Prints ready-to-paste .env lines
+
+USAGE:
+  python calibrate_threshold.py           # all cameras in data/
+  python calibrate_threshold.py data/cam1.mp4  # single camera
+"""
+
+import os, sys, glob, json
+from pathlib import Path
+from collections import defaultdict
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import torch, faiss, numpy as np
+
+from core.tracking.person_tracker import PersonTracker
+from core.reid.embedder           import PersonEmbedder
+
+FRAMES_TO_SAMPLE   = 300
+MIN_STABLE_FRAMES  = 20
+MAX_VECS_PER_TRACK = 8
+FLOOR_THRESHOLD    = 0.30
+SAFETY_MARGIN      = 0.03
+
+
+def calibrate_camera(video_path, cam_id, embedder, verbose=True):
+    from core.video.stream_reader import StreamReader
+
+    if verbose:
+        print(f"\n  ── {cam_id}: {video_path}")
+
+    tracker           = PersonTracker()
+    reader            = StreamReader(source=video_path, frame_skip=1)
+    track_vecs        = defaultdict(list)
+    track_frame_count = defaultdict(int)
+    frame_count       = 0
+
+    for frame_num, frame in reader.frames():
+        tracked                    = tracker.track(frame, camera_id=cam_id, frame_num=frame_num)
+        seen_this_frame            = set()
+
+        for p in tracked:
+            seen_this_frame.add(p.track_id)
+            track_frame_count[p.track_id] += 1
+
+            if (track_frame_count[p.track_id] >= MIN_STABLE_FRAMES and
+                    len(track_vecs[p.track_id]) < MAX_VECS_PER_TRACK):
+                vec = embedder.embed(p.crop)
+                if vec is not None:
+                    track_vecs[p.track_id].append(vec)
+
+        for tid in list(track_frame_count):
+            if tid not in seen_this_frame:
+                track_frame_count[tid] = 0
+
+        frame_count += 1
+        if frame_count % 50 == 0 and verbose:
+            print(f"    Frame {frame_count}/{FRAMES_TO_SAMPLE}  stable tracks: {len(track_vecs)}", end="\r")
+        if frame_count >= FRAMES_TO_SAMPLE:
+            break
+
+    reader.stop()
+    if verbose: print()
+
+    good = {tid: v for tid, v in track_vecs.items() if len(v) >= 3}
+    if len(good) < 2:
+        print(f"    WARNING: only {len(good)} stable track(s). Using fallback 0.65")
+        return 0.65
+
+    same_sims, diff_sims = [], []
+    for tid, vecs in good.items():
+        anchor = vecs[0]
+        for v in vecs[1:]: same_sims.append(float(np.dot(anchor, v)))
+
+    track_list = list(good.values())
+    for i in range(len(track_list)):
+        for j in range(i+1, min(i+5, len(track_list))):
+            diff_sims.append(float(np.dot(track_list[i][0], track_list[j][0])))
+
+    if not same_sims or not diff_sims:
+        return 0.65
+
+    same_min = min(same_sims);  same_avg = sum(same_sims)/len(same_sims)
+    diff_max = max(diff_sims);  diff_avg = sum(diff_sims)/len(diff_sims)
+
+    ideal     = (diff_avg + same_avg) / 2
+    threshold = min(ideal, same_min - SAFETY_MARGIN)
+    threshold = max(round(threshold, 2), FLOOR_THRESHOLD)
+
+    if verbose:
+        overlap = diff_max >= same_min
+        print(f"    Same-person: min={same_min:.3f}  avg={same_avg:.3f}")
+        print(f"    Diff-person: max={diff_max:.3f}  avg={diff_avg:.3f}")
+        if overlap:
+            print(f"    WARNING: distributions overlap — no perfect threshold possible")
+        print(f"    Recommended: {threshold:.2f}")
+
+    return threshold
+
+
+def write_thresholds_to_env(results: dict):
+    env_path  = ".env"
+    existing  = open(env_path).readlines() if os.path.exists(env_path) else []
+    new_keys  = {f"FAISS_THRESHOLD_{c.upper()}": v for c, v in results.items()}
+    kept      = [l for l in existing if not any(l.startswith(k) for k in new_keys)]
+    with open(env_path, "w") as f:
+        f.writelines(kept)
+        if kept and not kept[-1].endswith("\n"): f.write("\n")
+        f.write("\n# Per-camera Re-ID thresholds (written by calibrate_threshold.py)\n")
+        for k, v in sorted(new_keys.items()):
+            f.write(f"{k}={v}\n")
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+
+
+def main():
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        videos = [(sys.argv[1], Path(sys.argv[1]).stem)]
+    elif len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        videos = [(f, Path(f).stem) for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.mp4")))]
+    else:
+        videos = [(f, Path(f).stem) for f in sorted(glob.glob("data/*.mp4"))]
+
+    if not videos:
+        print("No .mp4 files found.")
+        sys.exit(1)
+
+    print(f"\nCalibrating Re-ID thresholds")
+    print(f"Cameras: {[v[1] for v in videos]}")
+    print(f"Frames per camera: {FRAMES_TO_SAMPLE}  |  Min stable frames: {MIN_STABLE_FRAMES}")
+
+    embedder = PersonEmbedder()
+    results  = {}
+
+    for path, cam_id in videos:
+        t = calibrate_camera(path, cam_id, embedder, verbose=True)
+        if t: results[cam_id] = t
+
+    if not results:
+        print("\nNo results."); sys.exit(1)
+
+    overall = round(min(results.values()) - 0.02, 2)
+    overall = max(overall, FLOOR_THRESHOLD)
+
+    write_thresholds_to_env(results)
+
+    print(f"\n{'='*60}")
+    print(f"  Add to .env (already written automatically):")
+    print(f"  FAISS_MATCH_THRESHOLD={overall}  (global fallback)")
+    for cam, thr in sorted(results.items()):
+        print(f"  FAISS_THRESHOLD_{cam.upper()}={thr}")
+    print(f"\nNext: python run_live.py data/ --fresh")
+
+
+if __name__ == "__main__":
+    main()

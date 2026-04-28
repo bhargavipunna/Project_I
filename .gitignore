@@ -1,0 +1,22 @@
+# Environments
+reid_env/
+venv/
+.env
+
+# Data and Models
+data/
+*.pt
+*.onnx
+*.engine
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
